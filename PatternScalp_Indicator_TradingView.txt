@@ -1,0 +1,286 @@
+//@version=6
+indicator("ORB Strategy - Solid Position Boxes", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// ==========================================
+// YOUR ORIGINAL INPUTS & PARAMETERS
+// ==========================================
+sessionInput    = input.session("1430-1445:1234567", title = "15-Min Opening Window")
+sessionTimeZone = input.string("GMT+1", title = "Session Timezone")
+atrDailyLen     = input.int(14, title = "Daily ATR Length")
+atrMultPct      = input.float(20.0, title = "Manipulation Candle Min Range (% of Daily ATR)") / 100.0
+stopBufferTicks = input.float(15, title = "Stop Buffer Beyond Wick (ticks)")   // FIX 4: was missing entirely
+
+// Visual Colors for Full Position Boxes
+colorBoxFill    = input.color(color.new(#1E293B, 85), title = "ORB Box Fill Color")
+colorBoxBorder  = input.color(#3B82F6, title = "ORB Border Color")
+
+// Position Tool Fill & Border Colors (Solid Box Appearance)
+colorRiskFill   = input.color(color.new(#4A1525, 30), title = "Risk Box Fill (Wine/Purple)") 
+colorRiskBorder = input.color(#991B1B, title = "Risk Box Border")
+colorRewFill    = input.color(color.new(#14532D, 30), title = "Reward Box Fill (Green)")
+colorRewBorder  = input.color(#166534, title = "Reward Box Border")
+
+// ==========================================
+// DATA RETRIEVAL
+// ==========================================
+// FIX 1: lookahead_on was leaking tomorrow's/today's not-yet-closed daily
+// range into past bars (a real repaint/look-ahead bug). lookahead_off is
+// the non-repainting setting, and the [1] holds it to the last FULLY
+// CLOSED daily bar all day, instead of quietly recalculating on today's
+// still-forming range as the day progresses.
+dailyATR = request.security(syminfo.tickerid, "D", ta.atr(atrDailyLen)[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+inOpeningWindow = not na(time(timeframe.period, sessionInput, sessionTimeZone))
+
+// FIX 3: this was missing entirely - nothing told you if you weren't on
+// the timeframe the entry scan actually needs.
+if barstate.islast and timeframe.in_seconds() != 300
+    label.new(bar_index, high, "⚠ Set the chart to 5 MINUTES for entries to work", color = color.red, style = label.style_label_down, textcolor = color.white)
+
+// ==========================================
+// STATE VARIABLES
+// ==========================================
+var int   sessionDay        = na
+var bool  orBoxLocked       = false
+var float orOpen            = na
+var float orClose           = na
+var float orHigh            = na
+var float orLow             = na
+var box   orBox             = na
+
+var int   tradeRead         = 0      
+var bool  manipFound        = false
+var float activeTarget      = na
+
+var bool  sessionTradeTaken = false
+var int   tradeState        = 0      
+var float pendingEntry      = na
+var float pendingSL         = na
+var float activeEntry       = na
+var float activeSL          = na
+var float tradeTarget       = na
+var int   entryBarIndex     = na
+
+// Position Tool Box Handles
+var box   activeRewardBox   = na
+var box   activeRiskBox     = na
+
+var float jwTriggerHigh     = na
+var float jwTriggerLow      = na
+
+// ==========================================
+// DAILY RESET
+// ==========================================
+isNewDay = ta.change(time("D")) != 0
+
+if isNewDay
+    sessionDay        := dayofmonth(time)
+    orBoxLocked       := false
+    orOpen            := na
+    orClose           := na
+    orHigh            := na
+    orLow             := na
+    orBox             := na
+    manipFound        := false
+    tradeRead         := 0
+    sessionTradeTaken := false
+    tradeState        := 0
+    pendingEntry      := na
+    pendingSL         := na
+    activeEntry       := na
+    activeSL          := na
+    tradeTarget       := na
+    entryBarIndex     := na
+    activeRewardBox   := na
+    activeRiskBox     := na
+
+// ==========================================
+// STEP 1: TIME-BASED 15-MIN ORB - also tracks open/close so we can read
+// this SAME candle's own direction (bullish/bearish close), per the video.
+// ==========================================
+if inOpeningWindow
+    if na(orOpen)
+        orOpen := open
+    orClose := close
+    if na(orHigh) or high > orHigh
+        orHigh := high
+    if na(orLow) or low < orLow
+        orLow := low
+        
+    if na(orBox)
+        orBox := box.new(left = bar_index, top = orHigh, right = bar_index + 1, bottom = orLow, 
+                         border_color = colorBoxBorder, bgcolor = colorBoxFill, xloc = xloc.bar_index)
+    else
+        box.set_top(orBox, orHigh)
+        box.set_bottom(orBox, orLow)
+        box.set_right(orBox, bar_index)
+
+// ==========================================
+// STEP 2: THE FIRST 15M CANDLE IS THE MANIPULATION CANDLE - evaluated
+// ONCE, the moment it closes. No separate later breakout candle. Its own
+// range vs Daily ATR decides if the session is tradable at all; its own
+// close vs open decides direction, CONTRARIAN to itself: a bearish box
+// candle reads BUY (expecting a reversal up), a bullish box candle reads
+// SELL (expecting a reversal down). If it doesn't qualify, there is no
+// trade this session - no waiting for a later candle instead.
+// ==========================================
+if not inOpeningWindow and not na(orHigh) and not orBoxLocked
+    orBoxLocked := true
+
+    float boxRange = orHigh - orLow
+    if boxRange >= (dailyATR * atrMultPct) and not na(orOpen) and not na(orClose) and orClose != orOpen
+        manipFound   := true
+        tradeRead    := orClose < orOpen ? 1 : -1
+        activeTarget := tradeRead == 1 ? orHigh : orLow
+
+        string manipText = tradeRead == 1 ? "Manip\n(BUY read)" : "Manip\n(SELL read)"
+        label.new(x = bar_index - 1, y = tradeRead == 1 ? orLow : orHigh,
+                  text = manipText, color = color.orange, textcolor = color.white,
+                  style = tradeRead == 1 ? label.style_label_up : label.style_label_down)
+
+        // The box candle's OWN last 5-minute sub-bar (one bar back, fully
+        // closed, no look-ahead) is immediately checked for John Wick /
+        // Power Tower on its own geometry - it can be the entry candle too.
+        float mBody       = math.abs(close[1] - open[1])
+        float mUpperWick  = high[1] - math.max(open[1], close[1])
+        float mLowerWick  = math.min(open[1], close[1]) - low[1]
+        bool  mBullEngulf = close[1] > open[1] and close[2] < open[2] and open[1] <= close[2] and close[1] >= open[2]
+        bool  mBearEngulf = close[1] < open[1] and close[2] > open[2] and open[1] >= close[2] and close[1] <= open[2]
+
+        bool mIsJohnWickBuy    = (tradeRead == 1)  and (mLowerWick >= 1.5 * mBody) and (mUpperWick <= 1.3 * mLowerWick)
+        bool mIsJohnWickSell   = (tradeRead == -1) and (mUpperWick >= 1.5 * mBody) and (mLowerWick <= 1.3 * mUpperWick)
+        bool mIsPowerTowerBuy  = (tradeRead == 1)  and mBullEngulf and (mUpperWick <= 0.40 * mBody) and (mLowerWick <= 0.40 * mBody)
+        bool mIsPowerTowerSell = (tradeRead == -1) and mBearEngulf and (mUpperWick <= 0.40 * mBody) and (mLowerWick <= 0.40 * mBody)
+
+        if mIsPowerTowerBuy or mIsPowerTowerSell
+            tradeState        := 2
+            sessionTradeTaken := true
+            activeEntry       := close[1]
+            activeSL          := mIsPowerTowerBuy ? (low[1] - stopBufferTicks * syminfo.mintick) : (high[1] + stopBufferTicks * syminfo.mintick)
+            tradeTarget       := activeTarget
+            entryBarIndex     := bar_index - 1
+
+            label.new(bar_index - 1, mIsPowerTowerBuy ? low[1] : high[1], text = "Power Tower", color = color.purple, textcolor = color.white, style = mIsPowerTowerBuy ? label.style_label_up : label.style_label_down)
+            activeRewardBox := box.new(left = entryBarIndex, top = math.max(activeEntry, tradeTarget), right = bar_index + 1, bottom = math.min(activeEntry, tradeTarget), border_color = colorRewBorder, border_style = line.style_solid, border_width = 1, bgcolor = colorRewFill, xloc = xloc.bar_index)
+            activeRiskBox   := box.new(left = entryBarIndex, top = math.max(activeEntry, activeSL), right = bar_index + 1, bottom = math.min(activeEntry, activeSL), border_color = colorRiskBorder, border_style = line.style_solid, border_width = 1, bgcolor = colorRiskFill, xloc = xloc.bar_index)
+
+        else if mIsJohnWickBuy or mIsJohnWickSell
+            tradeState    := 1
+            pendingEntry  := mIsJohnWickBuy ? high[1] : low[1]
+            pendingSL     := mIsJohnWickBuy ? (low[1] - stopBufferTicks * syminfo.mintick) : (high[1] + stopBufferTicks * syminfo.mintick)
+            jwTriggerHigh := high[1]
+            jwTriggerLow  := low[1]
+
+            label.new(bar_index - 1, mIsJohnWickBuy ? low[1] : high[1], text = "John Wick", color = color.orange, textcolor = color.white, style = mIsJohnWickBuy ? label.style_label_up : label.style_label_down)
+
+// ==========================================
+// STEP 3: PATTERNS & SOLID SHADED BOX DRAWING
+// ==========================================
+bodySize  = math.abs(close - open)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+// FIX 2: both lines were missing the check that the PRIOR candle was the
+// opposite color. Without it, a bigger bullish candle after a smaller
+// bullish candle could pass as "bullish engulfing" even though nothing
+// reversed - it wasn't confirming a real engulfing pattern, just a size
+// comparison.
+bool isBullEngulfing = close > open and close[1] < open[1] and open <= close[1] and close >= open[1]
+bool isBearEngulfing = close < open and close[1] > open[1] and open >= close[1] and close <= open[1]
+
+bool isJohnWickBuy  = (tradeRead == 1) and (lowerWick >= 1.5 * bodySize) and (upperWick <= 1.3 * lowerWick)
+bool isJohnWickSell = (tradeRead == -1) and (upperWick >= 1.5 * bodySize) and (lowerWick <= 1.3 * upperWick)
+
+bool isPowerTowerBuy  = (tradeRead == 1) and isBullEngulfing and (upperWick <= 0.40 * bodySize) and (lowerWick <= 0.40 * bodySize)
+bool isPowerTowerSell = (tradeRead == -1) and isBearEngulfing and (upperWick <= 0.40 * bodySize) and (lowerWick <= 0.40 * bodySize)
+
+if manipFound and not sessionTradeTaken
+
+    // Step 1: if a John Wick is currently pending, resolve it against its
+    // OWN trigger/invalidation levels first.
+    if tradeState == 1
+        bool invalidated = (tradeRead == 1 and low < jwTriggerLow) or (tradeRead == -1 and high > jwTriggerHigh)
+        
+        if invalidated
+            tradeState   := 0
+            pendingEntry := na
+            pendingSL    := na
+            label.new(bar_index, high, text = "JW Invalidated", color = color.gray, textcolor = color.white, style = label.style_label_down)
+            
+        else
+            bool triggered = (tradeRead == 1 and high >= pendingEntry) or (tradeRead == -1 and low <= pendingEntry)
+            if triggered
+                tradeState        := 2
+                sessionTradeTaken := true
+                activeEntry       := pendingEntry
+                activeSL          := pendingSL
+                tradeTarget       := activeTarget
+                entryBarIndex     := bar_index
+
+                // CREATE REWARD & RISK BOXES ON LIMIT ENTRY
+                activeRewardBox := box.new(left = entryBarIndex, top = math.max(activeEntry, tradeTarget), right = bar_index + 1, bottom = math.min(activeEntry, tradeTarget), border_color = colorRewBorder, border_style = line.style_solid, border_width = 1, bgcolor = colorRewFill, xloc = xloc.bar_index)
+                activeRiskBox   := box.new(left = entryBarIndex, top = math.max(activeEntry, activeSL), right = bar_index + 1, bottom = math.min(activeEntry, activeSL), border_color = colorRiskBorder, border_style = line.style_solid, border_width = 1, bgcolor = colorRiskFill, xloc = xloc.bar_index)
+
+    // Step 2: Power Tower - checked on THIS SAME bar regardless of what Step 1
+    // just did. This is what lets the very candle that invalidates an old
+    // John Wick immediately also count as a fresh entry itself, instead of
+    // being skipped until some future candle.
+    if (tradeState == 0 or tradeState == 1) and (isPowerTowerBuy or isPowerTowerSell)
+        tradeState        := 2
+        sessionTradeTaken := true
+        activeEntry       := close
+        activeSL          := isPowerTowerBuy ? (low - stopBufferTicks * syminfo.mintick) : (high + stopBufferTicks * syminfo.mintick)
+        tradeTarget       := activeTarget
+        entryBarIndex     := bar_index
+        pendingEntry      := na
+        pendingSL         := na
+
+        label.new(bar_index, isPowerTowerBuy ? low : high, text = "Power Tower", color = color.purple, textcolor = color.white, style = isPowerTowerBuy ? label.style_label_up : label.style_label_down)
+
+        // CREATE REWARD & RISK BOXES (Explicit Left/Right, Top/Bottom, Solid Styling)
+        activeRewardBox := box.new(left = entryBarIndex, top = math.max(activeEntry, tradeTarget), right = bar_index + 1, bottom = math.min(activeEntry, tradeTarget), border_color = colorRewBorder, border_style = line.style_solid, border_width = 1, bgcolor = colorRewFill, xloc = xloc.bar_index)
+        activeRiskBox   := box.new(left = entryBarIndex, top = math.max(activeEntry, activeSL), right = bar_index + 1, bottom = math.min(activeEntry, activeSL), border_color = colorRiskBorder, border_style = line.style_solid, border_width = 1, bgcolor = colorRiskFill, xloc = xloc.bar_index)
+
+    // Step 3: still idle after Steps 1-2? Check if THIS SAME bar also
+    // qualifies as a fresh John Wick - same reasoning as Step 2: a candle
+    // that just invalidated the old one, or a plain idle candle, gets
+    // judged on its own geometry immediately, same bar.
+    else if tradeState == 0 and (isJohnWickBuy or isJohnWickSell)
+        tradeState      := 1
+        pendingEntry    := isJohnWickBuy ? high : low
+        pendingSL       := isJohnWickBuy ? (low - stopBufferTicks * syminfo.mintick) : (high + stopBufferTicks * syminfo.mintick)
+        jwTriggerHigh   := high
+        jwTriggerLow    := low
+        
+        label.new(bar_index, isJohnWickBuy ? low : high, text = "John Wick", color = color.orange, textcolor = color.white, style = isJohnWickBuy ? label.style_label_up : label.style_label_down)
+
+    // --- State 2: Dynamic Box Stretch & Exit Lock ---
+    if tradeState == 2
+        bool hitTP = (tradeRead == 1 and high >= tradeTarget) or (tradeRead == -1 and low <= tradeTarget)
+        bool hitSL = (tradeRead == 1 and low <= activeSL) or (tradeRead == -1 and high >= activeSL)
+        
+        // Stretch box width bar by bar across candles
+        if not na(activeRewardBox)
+            box.set_right(activeRewardBox, bar_index)
+        if not na(activeRiskBox)
+            box.set_right(activeRiskBox, bar_index)
+
+        // Lock position boxes at exact exit bar when trade finishes
+        if hitTP or hitSL
+            if not na(activeRewardBox)
+                box.set_right(activeRewardBox, bar_index)
+            if not na(activeRiskBox)
+                box.set_right(activeRiskBox, bar_index)
+                
+            float riskPips   = math.abs(activeEntry - activeSL)
+            float rewardPips = math.abs(tradeTarget - activeEntry)
+            float rrRatio    = riskPips > 0 ? rewardPips / riskPips : 0.0
+            int   barsInTrade = bar_index - entryBarIndex
+            
+            string targetLabelText = "Target: " + str.tostring(rewardPips, "#.#") + " | R:R " + str.tostring(rrRatio, "#.##") + " | " + str.tostring(barsInTrade) + " bars"
+            string stopLabelText   = "Stop: " + str.tostring(riskPips, "#.#")
+            
+            label.new(bar_index, tradeTarget, text = targetLabelText, color = color.green, textcolor = color.white, style = tradeRead == 1 ? label.style_label_down : label.style_label_up)
+            label.new(entryBarIndex, activeSL, text = stopLabelText, color = color.red, textcolor = color.white, style = tradeRead == 1 ? label.style_label_up : label.style_label_down)
+            
+            tradeState := 3

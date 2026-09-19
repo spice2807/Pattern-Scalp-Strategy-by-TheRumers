@@ -1,0 +1,511 @@
+//+------------------------------------------------------------------+
+//|                                    PatternScalp_EA.mq5            |
+//|   Full trading EA for "The Rumers" (Doug) - Pattern Scalp.       |
+//|   Single file: real order execution AND on-chart visuals, no     |
+//|   separate indicator. Built for the Strategy Tester first -      |
+//|   verify there thoroughly before any live/demo attachment.       |
+//|                                                                    |
+//|   Rule provenance:                                                |
+//|   - The FIRST 15-minute candle of the session IS the manipulation |
+//|     candle - not a separate later breakout candle. HIS, confirmed |
+//|     on review of the video. Evaluated once, the moment it closes: |
+//|       - its own range vs Daily ATR(14) decides if the session is  |
+//|         tradable at all (no trade if it doesn't qualify - no      |
+//|         waiting for a later candle instead)                       |
+//|       - its own close vs open decides direction, CONTRARIAN to    |
+//|         itself: bearish box candle -> BUY, bullish -> SELL        |
+//|   - Target = opposite side of that same box. HIS.                 |
+//|   - John Wick = doji-shaped candle, color-blind: same-side wick   |
+//|     >= 1.5x body AND opposite wick <= 1.3x the same-side wick.    |
+//|     OURS - he never quantifies this on camera.                    |
+//|   - John Wick entry = stop order at the candle's high (buy) / low |
+//|     (sell). Invalidated if the opposite extreme breaks first.     |
+//|   - Power Tower = standard engulfing candle (body-based - the     |
+//|     existing/standard definition per your own standing rule for   |
+//|     this project), qualified only if each wick individually       |
+//|     <= 40% of its own body. Entered directly, no retracement.     |
+//|   - The candle that invalidates a pending John Wick, and the box  |
+//|     candle's own last 5-minute segment, are BOTH immediately      |
+//|     re-checked as fresh entries in their own right - confirmed in |
+//|     review, same bar, no waiting for a future candle.             |
+//|   - NEW: if price has already reached the target before an entry  |
+//|     ever happens, the session is invalidated - no trade. OURS,    |
+//|     per explicit review.                                          |
+//|   - NEW: two selectable take-profit styles (OURS, he never        |
+//|     specified management style) - see InpTPStyle below.           |
+//|   - NEW: time-windowed entries + hard force-close. OURS.          |
+//+------------------------------------------------------------------+
+#property copyright "Backtest the Hype"
+#property version   "1.00"
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//====================================================================
+// INPUTS
+//====================================================================
+input string  InpSessionStart      = "16:30";  // Session/box start (HH:MM, BROKER server time)
+input double  InpEntryWindowHours  = 7.0;      // Stop looking for a NEW entry this many hours after session start
+input double  InpForceCloseHours   = 8.0;      // Force-close any still-open position this many hours after session start
+
+input double  InpAtrMultPct        = 20.0;     // Box candle range must exceed this % of Daily ATR(14) to qualify
+input int     InpAtrLen            = 14;
+
+input double  InpJohnWickBodyMult  = 1.5;      // John Wick: same-side wick >= x * body
+input double  InpJohnWickOppMult   = 1.3;      // John Wick: opposite wick <= x * same-side wick
+input double  InpEngulfMaxWickPct  = 40.0;     // Power Tower: max wick % of body (each side)
+input double  InpStopBufferPoints  = 15.0;     // Stop buffer beyond the wick/invalidation level, in points
+
+enum ENUM_TP_STYLE
+{
+   TP_BOX_LEVEL_ONLY,      // Full close at the opposite side of the box - nothing else
+   TP_PARTIAL_BREAKEVEN    // If box target >= 1:1, partial at 1:1 + move SL to breakeven, let rest run to box level
+};
+input ENUM_TP_STYLE InpTPStyle        = TP_PARTIAL_BREAKEVEN;
+input double         InpPartialClosePct = 50.0;   // % of position closed at the 1:1 point (TP_PARTIAL_BREAKEVEN only) - no number was specified, 50% is a reasonable default, adjust freely
+
+input double  InpRiskUSD           = 1000.0;   // Fixed $ risk per trade
+input int     InpSlippagePoints    = 20;
+input ulong   InpMagicNumber       = 774411;
+input string  InpTradeComment      = "PatternScalp";
+input bool    InpShowVisuals       = true;     // Draw the box/labels/entry markers on the chart
+
+//====================================================================
+// GLOBALS
+//====================================================================
+#define PS_STATE_SEEK     0   // before the box has closed
+#define PS_STATE_WATCHING 1   // box closed, qualified, watching for John Wick / Power Tower
+#define PS_STATE_ARMED    2   // John Wick pending order placed, awaiting trigger/invalidation
+#define PS_STATE_ACTIVE   3   // position open
+#define PS_STATE_DONE     4   // session concluded (traded, or invalidated/no-trade) - nothing more today
+
+int      g_atrHandle = INVALID_HANDLE;
+
+datetime g_lastDayStart   = 0;
+datetime g_windowStart    = 0;   // today's session/box start time
+datetime g_windowEnd      = 0;   // windowStart + 15 minutes
+datetime g_entryCutoff    = 0;   // windowStart + InpEntryWindowHours
+datetime g_forceCloseTime = 0;   // windowStart + InpForceCloseHours
+
+bool     g_boxLocked  = false;
+double   g_orOpen = 0, g_orHigh = 0, g_orLow = 0, g_orClose = 0;
+bool     g_orOpenSet = false;
+
+// rolling memory of the last two M5 candles seen INSIDE the opening window,
+// so the box candle's own last segment can be checked for John Wick / Power
+// Tower the instant the window closes (mirrors the TradingView build)
+double   g_lastWinO=0, g_lastWinH=0, g_lastWinL=0, g_lastWinC=0;
+double   g_prevWinO=0, g_prevWinC=0;
+bool     g_haveLastWin=false, g_havePrevWin=false;
+
+int      g_state     = PS_STATE_SEEK;
+int      g_tradeRead = 0;      // +1 buy, -1 sell
+double   g_activeTarget = 0;
+
+double   g_pendingEntry=0, g_pendingSL=0;
+double   g_jwTriggerHigh=0, g_jwTriggerLow=0;
+ulong    g_pendingOrderTicket = 0;
+
+double   g_activeEntry=0, g_activeSL=0, g_tradeTarget=0;
+bool     g_partialDone = false;
+
+datetime g_lastM5Bar = 0;
+
+//====================================================================
+// HELPERS
+//====================================================================
+int TimeStrToSeconds(string hhmm)
+{
+   string parts[];
+   int n = StringSplit(hhmm, ':', parts);
+   if(n < 2) return 0;
+   return ((int)StringToInteger(parts[0]) * 3600) + ((int)StringToInteger(parts[1]) * 60);
+}
+
+double GetDailyATR()
+{
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   // shift=1 -> the last FULLY CLOSED daily bar, never today's still-forming one
+   if(CopyBuffer(g_atrHandle, 0, 1, 1, buf) <= 0) return 0;
+   return buf[0];
+}
+
+void CandleParts(double o, double h, double l, double c, double &body, double &upperWick, double &lowerWick)
+{
+   body      = MathAbs(c - o);
+   upperWick = h - MathMax(o, c);
+   lowerWick = MathMin(o, c) - l;
+}
+
+bool IsJohnWick(double o, double h, double l, double c, int dir)
+{
+   double body, uw, lw;
+   CandleParts(o, h, l, c, body, uw, lw);
+   if(body <= 0) body = _Point;
+   if(dir > 0) return (lw >= InpJohnWickBodyMult * body) && (uw <= InpJohnWickOppMult * lw);
+   else        return (uw >= InpJohnWickBodyMult * body) && (lw <= InpJohnWickOppMult * uw);
+}
+
+// body-based engulfing (the existing/standard definition, per your own
+// standing rule - he never specifies wick-inclusion)
+bool IsPowerTower(double prevO, double prevC, double o, double h, double l, double c, int dir)
+{
+   bool engulf;
+   if(dir > 0) engulf = (c > o) && (prevC < prevO) && (o <= prevC) && (c >= prevO);
+   else        engulf = (c < o) && (prevC > prevO) && (o >= prevC) && (c <= prevO);
+   if(!engulf) return false;
+
+   double body, uw, lw;
+   CandleParts(o, h, l, c, body, uw, lw);
+   if(body <= 0) return false;
+   double maxWick = body * (InpEngulfMaxWickPct / 100.0);
+   return (uw <= maxWick) && (lw <= maxWick);
+}
+
+double GetLots(double slDistancePrice)
+{
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double minLot    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double stepLot   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(slDistancePrice <= 0 || tickValue <= 0 || tickSize <= 0) return minLot;
+
+   double lossPerLot = (slDistancePrice / tickSize) * tickValue;
+   if(lossPerLot <= 0) return minLot;
+
+   double lots = InpRiskUSD / lossPerLot;
+   lots = MathFloor(lots / stepLot) * stepLot;
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   return lots;
+}
+
+ulong GetOpenPositionTicket()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == (long)InpMagicNumber) return ticket;
+   }
+   return 0;
+}
+
+ulong GetPendingOrderTicket()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetInteger(ORDER_MAGIC) == (long)InpMagicNumber) return ticket;
+   }
+   return 0;
+}
+
+void DeleteAnyPendingOrder()
+{
+   ulong t = GetPendingOrderTicket();
+   if(t != 0) trade.OrderDelete(t);
+   g_pendingOrderTicket = 0;
+}
+
+void CloseAnyOpenPosition()
+{
+   ulong t = GetOpenPositionTicket();
+   if(t != 0) trade.PositionClose(t);
+}
+
+//--- visuals ---------------------------------------------------------
+void DrawBox(string name, datetime t1, double p1, datetime t2, double p2, color clr)
+{
+   if(!InpShowVisuals) return;
+   ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, p1, t2, p2);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_FILL, false);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_BACK, true);
+}
+
+void DrawLabel(string name, datetime t, double price, string text, color clr, int anchor)
+{
+   if(!InpShowVisuals) return;
+   ObjectCreate(0, name, OBJ_TEXT, 0, t, price);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, anchor);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+}
+
+//====================================================================
+// DAILY RESET
+//====================================================================
+void BuildSession(datetime dayStart)
+{
+   g_windowStart    = dayStart + TimeStrToSeconds(InpSessionStart);
+   g_windowEnd      = g_windowStart + 15 * 60;
+   g_entryCutoff    = g_windowStart + (datetime)(InpEntryWindowHours  * 3600);
+   g_forceCloseTime = g_windowStart + (datetime)(InpForceCloseHours * 3600);
+
+   g_boxLocked  = false;
+   g_orOpenSet  = false;
+   g_orOpen = 0; g_orHigh = 0; g_orLow = 0; g_orClose = 0;
+   g_haveLastWin = false; g_havePrevWin = false;
+
+   g_state       = PS_STATE_SEEK;
+   g_tradeRead   = 0;
+   g_activeTarget= 0;
+
+   g_pendingEntry = 0; g_pendingSL = 0;
+   g_jwTriggerHigh = 0; g_jwTriggerLow = 0;
+   DeleteAnyPendingOrder();
+
+   g_activeEntry = 0; g_activeSL = 0; g_tradeTarget = 0;
+   g_partialDone = false;
+
+   if(GetOpenPositionTicket() != 0) CloseAnyOpenPosition(); // stray position from a prior session, if any
+}
+
+//====================================================================
+// ENTRY LOGIC ON A NEWLY-CLOSED M5 CANDLE
+//====================================================================
+void ArmJohnWick(int dir, double barHigh, double barLow)
+{
+   g_jwTriggerHigh = barHigh;
+   g_jwTriggerLow  = barLow;
+   g_pendingEntry  = (dir > 0) ? barHigh : barLow;
+   g_pendingSL     = (dir > 0) ? (barLow - InpStopBufferPoints * _Point) : (barHigh + InpStopBufferPoints * _Point);
+   g_state         = PS_STATE_ARMED;
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   bool ok;
+   if(dir > 0) ok = trade.BuyStop(GetLots(MathAbs(g_pendingEntry - g_pendingSL)), g_pendingEntry, _Symbol, g_pendingSL, g_activeTarget, ORDER_TIME_GTC, 0, InpTradeComment);
+   else        ok = trade.SellStop(GetLots(MathAbs(g_pendingEntry - g_pendingSL)), g_pendingEntry, _Symbol, g_pendingSL, g_activeTarget, ORDER_TIME_GTC, 0, InpTradeComment);
+   if(ok) g_pendingOrderTicket = trade.ResultOrder();
+
+   DrawLabel("PS_JW_" + IntegerToString((int)TimeCurrent()), TimeCurrent(), dir > 0 ? barLow : barHigh,
+             "John Wick", clrDarkOrange, dir > 0 ? ANCHOR_TOP : ANCHOR_BOTTOM);
+}
+
+void EnterMarket(int dir, double entryPx, double slPx, datetime evtTime)
+{
+   DeleteAnyPendingOrder();
+   double lots = GetLots(MathAbs(entryPx - slPx));
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   bool ok;
+   if(dir > 0) ok = trade.Buy(lots, _Symbol, 0, slPx, g_activeTarget, InpTradeComment);
+   else        ok = trade.Sell(lots, _Symbol, 0, slPx, g_activeTarget, InpTradeComment);
+
+   if(ok)
+   {
+      g_activeEntry  = entryPx;
+      g_activeSL     = slPx;
+      g_tradeTarget  = g_activeTarget;
+      g_partialDone  = false;
+      g_state        = PS_STATE_ACTIVE;
+      DrawLabel("PS_Entry_" + IntegerToString((int)TimeCurrent()), evtTime, entryPx, "Power Tower entry", clrPurple, dir > 0 ? ANCHOR_TOP : ANCHOR_BOTTOM);
+   }
+}
+
+void EvaluateBoxClose()
+{
+   // The box candle IS the manipulation candle - one-shot check, right now.
+   double boxRange = g_orHigh - g_orLow;
+   double atr = GetDailyATR();
+   if(atr <= 0) return;
+   if(boxRange < atr * (InpAtrMultPct / 100.0)) return;      // doesn't qualify - no trade today
+   if(g_orClose == g_orOpen) return;                          // no clear direction - skip
+
+   g_tradeRead    = (g_orClose < g_orOpen) ? 1 : -1;           // bearish box -> BUY, bullish -> SELL
+   g_activeTarget = (g_tradeRead == 1) ? g_orHigh : g_orLow;
+   g_state        = PS_STATE_WATCHING;
+
+   DrawBox("PS_Box_" + IntegerToString((int)g_windowStart), g_windowStart, g_orHigh, g_windowEnd, g_orLow, clrDodgerBlue);
+   DrawLabel("PS_Manip_" + IntegerToString((int)g_windowStart), g_windowEnd,
+             g_tradeRead == 1 ? g_orLow : g_orHigh,
+             g_tradeRead == 1 ? "Manip (BUY read)" : "Manip (SELL read)",
+             clrOrange, g_tradeRead == 1 ? ANCHOR_TOP : ANCHOR_BOTTOM);
+
+   // The box candle's OWN last 5-minute segment is immediately checked as a
+   // possible entry in its own right - it doesn't have to wait for a future
+   // candle just because it happens to be the manipulation candle.
+   if(g_havePrevWin && IsPowerTower(g_prevWinO, g_prevWinC, g_lastWinO, g_lastWinH, g_lastWinL, g_lastWinC, g_tradeRead))
+   {
+      EnterMarket(g_tradeRead, g_lastWinC,
+                  g_tradeRead == 1 ? g_lastWinL - InpStopBufferPoints * _Point : g_lastWinH + InpStopBufferPoints * _Point,
+                  g_windowEnd);
+   }
+   else if(IsJohnWick(g_lastWinO, g_lastWinH, g_lastWinL, g_lastWinC, g_tradeRead))
+   {
+      ArmJohnWick(g_tradeRead, g_lastWinH, g_lastWinL);
+   }
+}
+
+// Called once per newly-closed M5 bar while WATCHING or ARMED
+void ProcessM5BarForEntry(double o, double h, double l, double c, double prevO, double prevC, datetime barTime)
+{
+   if(g_state != PS_STATE_WATCHING && g_state != PS_STATE_ARMED) return;
+
+   // NEW: if price has already reached the target before we've entered,
+   // there is no point taking (or continuing to wait on) this trade.
+   bool targetAlreadyHit = (g_tradeRead == 1 && h >= g_activeTarget) || (g_tradeRead == -1 && l <= g_activeTarget);
+   if(targetAlreadyHit)
+   {
+      DeleteAnyPendingOrder();
+      g_state = PS_STATE_DONE;
+      DrawLabel("PS_NoTrade_" + IntegerToString((int)barTime), barTime, g_tradeRead == 1 ? h : l,
+                "No Trade (target already hit)", clrGray, g_tradeRead == 1 ? ANCHOR_BOTTOM : ANCHOR_TOP);
+      return;
+   }
+
+   // Step 1: resolve a pending John Wick first
+   if(g_state == PS_STATE_ARMED)
+   {
+      bool invalidated = (g_tradeRead == 1 && l < g_jwTriggerLow) || (g_tradeRead == -1 && h > g_jwTriggerHigh);
+      if(invalidated)
+      {
+         DeleteAnyPendingOrder();
+         g_state = PS_STATE_WATCHING;
+         DrawLabel("PS_Inv_" + IntegerToString((int)barTime), barTime, g_tradeRead == 1 ? l : h, "JW Invalidated", clrGray, g_tradeRead == 1 ? ANCHOR_BOTTOM : ANCHOR_TOP);
+      }
+      else if(GetOpenPositionTicket() != 0)
+      {
+         // the pending stop order already filled since we last checked
+         g_activeEntry = g_pendingEntry;
+         g_activeSL    = g_pendingSL;
+         g_tradeTarget = g_activeTarget;
+         g_partialDone = false;
+         g_state       = PS_STATE_ACTIVE;
+      }
+   }
+
+   // Step 2: Power Tower - checked regardless of what Step 1 just did (a
+   // candle that invalidates the old John Wick, or an idle candle, is
+   // judged fresh, same bar)
+   if((g_state == PS_STATE_WATCHING || g_state == PS_STATE_ARMED) && IsPowerTower(prevO, prevC, o, h, l, c, g_tradeRead))
+   {
+      double slPx = (g_tradeRead == 1) ? (l - InpStopBufferPoints * _Point) : (h + InpStopBufferPoints * _Point);
+      EnterMarket(g_tradeRead, c, slPx, barTime);
+   }
+   else if(g_state == PS_STATE_WATCHING && IsJohnWick(o, h, l, c, g_tradeRead))
+   {
+      ArmJohnWick(g_tradeRead, h, l);
+   }
+}
+
+//====================================================================
+// OPEN-POSITION MANAGEMENT (partial + breakeven, force-close by time)
+//====================================================================
+void ManageOpenTrade()
+{
+   ulong ticket = GetOpenPositionTicket();
+   if(ticket == 0)
+   {
+      if(g_state == PS_STATE_ACTIVE) g_state = PS_STATE_DONE; // closed out (TP/SL hit at broker level)
+      return;
+   }
+   if(!PositionSelectByTicket(ticket)) return;
+
+   // Hard time backstop, regardless of TP style
+   if(TimeCurrent() >= g_forceCloseTime)
+   {
+      trade.PositionClose(ticket);
+      g_state = PS_STATE_DONE;
+      return;
+   }
+
+   if(InpTPStyle != TP_PARTIAL_BREAKEVEN || g_partialDone) return;
+
+   double riskDist   = MathAbs(g_activeEntry - g_activeSL);
+   double rewardDist = MathAbs(g_tradeTarget - g_activeEntry);
+   if(riskDist <= 0 || rewardDist < riskDist) return; // < 1:1 -> nothing to modify, runs straight to box level
+
+   double oneToOnePx = (g_tradeRead == 1) ? (g_activeEntry + riskDist) : (g_activeEntry - riskDist);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   bool reached = (g_tradeRead == 1 && bid >= oneToOnePx) || (g_tradeRead == -1 && ask <= oneToOnePx);
+   if(!reached) return;
+
+   double vol       = PositionGetDouble(POSITION_VOLUME);
+   double closeVol  = vol * (InpPartialClosePct / 100.0);
+   double stepLot   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   closeVol = MathFloor(closeVol / stepLot) * stepLot;
+   double minLot    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(closeVol >= minLot && closeVol < vol)
+      trade.PositionClosePartial(ticket, closeVol);
+
+   trade.PositionModify(ticket, g_activeEntry, g_tradeTarget); // SL -> breakeven, TP stays at the box level
+   g_partialDone = true;
+   DrawLabel("PS_BE_" + IntegerToString((int)TimeCurrent()), TimeCurrent(), oneToOnePx, "1:1 - Partial + BE", clrYellow, ANCHOR_LEFT);
+}
+
+//====================================================================
+// MAIN LOOP
+//====================================================================
+int OnInit()
+{
+   g_atrHandle = iATR(_Symbol, PERIOD_D1, InpAtrLen);
+   trade.SetDeviationInPoints(InpSlippagePoints);
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+}
+
+void OnTick()
+{
+   ManageOpenTrade();
+
+   datetime now = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+   datetime dayStart = now - (dt.hour * 3600 + dt.min * 60 + dt.sec);
+
+   if(dayStart != g_lastDayStart)
+   {
+      g_lastDayStart = dayStart;
+      BuildSession(dayStart);
+   }
+
+   // Stop looking for NEW entries past the cutoff - cancels an armed
+   // pending John Wick too, since it hasn't actually filled yet.
+   if(now >= g_entryCutoff && (g_state == PS_STATE_WATCHING || g_state == PS_STATE_ARMED))
+   {
+      DeleteAnyPendingOrder();
+      g_state = PS_STATE_DONE;
+   }
+
+   datetime curM5Bar = iTime(_Symbol, PERIOD_M5, 0);
+   if(curM5Bar == g_lastM5Bar) return;
+   g_lastM5Bar = curM5Bar;
+
+   // the bar that JUST closed is shift=1 at this moment
+   double o = iOpen(_Symbol, PERIOD_M5, 1), h = iHigh(_Symbol, PERIOD_M5, 1);
+   double l = iLow(_Symbol, PERIOD_M5, 1),  c = iClose(_Symbol, PERIOD_M5, 1);
+   datetime bt = iTime(_Symbol, PERIOD_M5, 1);
+
+   if(bt >= g_windowStart && bt < g_windowEnd)
+   {
+      // inside the opening window - accumulate the box
+      if(!g_orOpenSet) { g_orOpen = o; g_orOpenSet = true; }
+      g_orClose = c;
+      if(g_orHigh == 0 || h > g_orHigh) g_orHigh = h;
+      if(g_orLow  == 0 || l < g_orLow)  g_orLow  = l;
+
+      if(g_haveLastWin) { g_prevWinO = g_lastWinO; g_prevWinC = g_lastWinC; g_havePrevWin = true; }
+      g_lastWinO = o; g_lastWinH = h; g_lastWinL = l; g_lastWinC = c;
+      g_haveLastWin = true;
+   }
+   else if(bt >= g_windowEnd && !g_boxLocked && g_orOpenSet)
+   {
+      g_boxLocked = true;
+      EvaluateBoxClose();
+   }
+   else if(g_boxLocked && (g_state == PS_STATE_WATCHING || g_state == PS_STATE_ARMED))
+   {
+      double prevO = iOpen(_Symbol, PERIOD_M5, 2), prevC = iClose(_Symbol, PERIOD_M5, 2);
+      ProcessM5BarForEntry(o, h, l, c, prevO, prevC, bt);
+   }
+}
